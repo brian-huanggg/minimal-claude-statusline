@@ -16,8 +16,11 @@
 #     ~/.claude/statusline-cache.json (single, fixed-size, atomically
 #     overwritten).  A session only sees new numbers when *it* calls the API,
 #     so parallel sessions otherwise drift; usage is monotonic within a window,
-#     so "later window wins, then larger number wins" makes them converge — and
-#     fills the startup window instead of showing n/a.
+#     so "later window wins, then larger number wins" makes them converge.
+#   - At most once a minute (shared), the account's real numbers are fetched
+#     from the OAuth usage endpoint and replace the cache, so a new session
+#     opens on current usage, not the last session's.  Windows whose reset time
+#     has passed are dropped.  STATUSLINE_FETCH=0 disables the fetch.
 #   - Line 2 answers "where am I": repo, the path inside it, and the branch —
 #     one semantic group, so they share a row and leave line 1 to identity.
 #   - Color has a job: icons are blue (structure you can find at a glance), text
@@ -65,6 +68,10 @@ HIGH=70  # < HIGH -> yellow ; >= HIGH -> red
 
 CACHE="${HOME}/.claude/statusline-cache.json"
 
+USAGE_URL='https://api.anthropic.com/api/oauth/usage'
+FETCH_TTL=60      # seconds between live fetches, shared by all sessions
+FETCH_TIMEOUT=2   # curl max-time; a slow network never stalls the line longer
+
 # ---- read + parse (single guarded jq pass) --------------------------------
 input=$(cat)
 
@@ -96,15 +103,59 @@ cache_json='{}'
 if [[ -f "$CACHE" ]]; then
   c=$(<"$CACHE") && jq -e . >/dev/null 2>&1 <<< "$c" && cache_json=$c
 fi
+now=$(date +%s)
+
+# ---- live refresh: ask the account, not the last session ------------------
+# stdin carries no rate_limits until *this* session's first API call, and even
+# then it never counts usage from claude.ai chats or other machines — so a
+# fresh session would otherwise open on whatever an old session cached.  The
+# OAuth usage endpoint (the one behind /usage; undocumented) reports the
+# account-wide numbers.  Shared TTL across sessions; failures are throttled
+# too, so offline / expired-token runs fall back to the cache without stalling.
+oauth_token() {
+  local creds
+  creds=$(security find-generic-password -s 'Claude Code-credentials' -w 2>/dev/null) ||
+    creds=$(cat "${HOME}/.claude/.credentials.json" 2>/dev/null) || return 1
+  jq -r '.claudeAiOauth.accessToken // empty' <<< "$creds" 2>/dev/null
+}
+
+fetch_usage() {                       # prints r5_pct US r5_reset US r7_pct US r7_reset
+  local tok body
+  tok=$(oauth_token) && [[ -n "$tok" ]] || return 1
+  # token goes in via stdin, never argv, so it can't show up in `ps`
+  body=$(curl -sf -m "$FETCH_TIMEOUT" -H @- -H 'anthropic-beta: oauth-2025-04-20' \
+           "$USAGE_URL" <<< "Authorization: Bearer $tok" 2>/dev/null) || return 1
+  jq -er '
+    # "2026-09-30T09:00:00.324+00:00" -> epoch, to match stdin resets_at
+    def epoch: (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601)? // "";
+    [ (.five_hour.utilization // ""), (.five_hour.resets_at // "" | epoch),
+      (.seven_day.utilization // ""), (.seven_day.resets_at // "" | epoch)
+    ] | map(tostring) | join("\u001f")
+  ' <<< "$body" 2>/dev/null
+}
+
+fetched_at=$(jq -r '.fetched_at // 0 | tonumber? // 0' <<< "$cache_json" 2>/dev/null)
+if [[ "${STATUSLINE_FETCH:-1}" != 0 ]] && (( now - ${fetched_at:-0} >= FETCH_TTL )); then
+  fetched_at=$now
+  if fetched=$(fetch_usage); then
+    IFS=$'\037' read -r f5 fr5 f7 fr7 <<< "$fetched"
+    # fresher than anything cached, so it replaces the cache outright
+    cache_json=$(jq -cn --arg a "$f5" --arg b "$fr5" --arg c "$f7" --arg d "$fr7" \
+      '{r5_pct: $a, r5_reset: $b, r7_pct: $c, r7_reset: $d}')
+  fi
+fi
 
 merged=$(
-  jq -rn --argjson c "$cache_json" \
+  jq -rn --argjson c "$cache_json" --argjson now "$now" \
     --arg lp5 "$r5_pct" --arg lr5 "$r5_reset" \
     --arg lp7 "$r7_pct" --arg lr7 "$r7_reset" '
       def num: tostring | tonumber? // 0;
+      # a window whose reset time has passed describes nothing any more
+      def expired(r): (r|num) > 0 and (r|num) <= $now;
       def pick(lp; lr; cp; cr):
-        if   (lp // "") == ""     then [cp // "", cr // ""]
-        elif (cp // "") == ""     then [lp, lr]
+        if   (lp // "") == "" or expired(lr) then
+          (if (cp // "") == "" or expired(cr) then ["", ""] else [cp, cr // ""] end)
+        elif (cp // "") == "" or expired(cr) then [lp, lr]
         elif (cr|num) > (lr|num)  then [cp, cr]        # cache is a newer window
         elif (cr|num) < (lr|num)  then [lp, lr]        # live is a newer window
         elif (cp|num) > (lp|num)  then [cp, cr]        # same window, cache saw more
@@ -118,13 +169,12 @@ merged=$(
   IFS=$'\037' read -r r5_pct r5_reset r7_pct r7_reset <<< "$merged"
 
 # persist the merged view so every session converges on the same numbers
-if [[ -n "$r5_pct" || -n "$r7_pct" ]]; then
-  tmp=$(mktemp "${CACHE}.XXXXXX" 2>/dev/null) && {
-    printf '{"r5_pct":"%s","r5_reset":"%s","r7_pct":"%s","r7_reset":"%s"}\n' \
-      "$r5_pct" "$r5_reset" "$r7_pct" "$r7_reset" > "$tmp" && mv "$tmp" "$CACHE" \
-      || rm -f "$tmp"
-  }
-fi
+# (always written: fetched_at must stick even when a fetch failed)
+tmp=$(mktemp "${CACHE}.XXXXXX" 2>/dev/null) && {
+  printf '{"r5_pct":"%s","r5_reset":"%s","r7_pct":"%s","r7_reset":"%s","fetched_at":%d}\n' \
+    "$r5_pct" "$r5_reset" "$r7_pct" "$r7_reset" "${fetched_at:-0}" > "$tmp" &&
+    mv "$tmp" "$CACHE" || rm -f "$tmp"
+}
 
 # ---- responsive tier -------------------------------------------------------
 cols=${COLUMNS:-80}

@@ -38,7 +38,7 @@ everything, so gray is spent only where it means "you can ignore this".
 - **Icons** — blue (`#58a6ff`), uniformly. Structure you can find at a glance.
 - **Values** — plain foreground (repo, branch, effort, labels). Legible, not
   shouting.
-- **Reset timestamps** — the only grayed-out text; a dim `~` marks cached values.
+- **Reset timestamps** — the only grayed-out text.
   A path's parent components are dimmed too, so the directory you're actually in
   is the part that reads.
 - **Model** — orange (`#ffa657`), bold. Line 1's single anchor, same for every
@@ -48,12 +48,21 @@ everything, so gray is spent only where it means "you can ignore this".
 - **Effort** — borrows the usage ramp as it gets expensive: `low` gray ·
   `medium` green · `high` orange · `xhigh` red · `max` bold red.
 
-### Startup cache
+### Live usage, not the last session's
 
-`rate_limits` is empty until the first API response (~10–15 s), so the two token
-lines are cached to `~/.claude/statusline-cache.json` (a single, fixed-size,
-atomically-overwritten file). During the warm-up window the last-known numbers
-are shown with a dim `~` prefix; context shows a `⋯` skeleton until live.
+`rate_limits` is empty until a session's first API response, and even then it
+never counts usage from claude.ai chats or other machines. So at most once a
+minute (shared across sessions) the status line asks the account directly: it
+reads Claude Code's OAuth token (macOS Keychain, or `~/.claude/.credentials.json`)
+and calls the undocumented usage endpoint behind `/usage`
+(`api.anthropic.com/api/oauth/usage`, 2 s timeout, token passed on stdin, never
+argv). A new session therefore opens on current numbers.
+
+Results are merged into `~/.claude/statusline-cache.json` (a single, fixed-size,
+atomically-overwritten file), which remains the fallback when the fetch fails
+(offline, expired token). A window whose reset time has passed is dropped
+(`n/a`) and never shown as current. Set `STATUSLINE_FETCH=0` to disable the fetch;
+context shows a `⋯` skeleton until live.
 
 ### Responsive
 
@@ -66,6 +75,7 @@ model's first word.
 
 - [`jq`](https://jqlang.org/) — used by both the status line and the installer.
   Install with `brew install jq` (macOS) or `apt install jq` (Debian/Ubuntu).
+- `curl` — for the live usage fetch (optional; without it the cache is used).
 
 ## Install (one command)
 
@@ -128,8 +138,8 @@ echo '{"model":{"display_name":"Sonnet 5"},"context_window":{"used_percentage":n
 ## Design constraints
 
 - **Single `jq` pass** (`@tsv`) extracts all 7 fields at once → fast cold start.
-- **No temp files, no cached state** → no leaks, no staleness. (No git calls, so
-  no caching is needed.)
+- **One fixed-size cache file**, refreshed from the account at most once a
+  minute, with expired windows dropped → no leaks, bounded staleness.
 - **Graceful fallbacks**: `rate_limits` is absent for non–Pro/Max users and until
   the first API response → shows `n/a`. `context_window.used_percentage` is `null`
   at session start and after `/compact` → treated as `0`.
